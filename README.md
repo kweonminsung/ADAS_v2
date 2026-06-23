@@ -3,6 +3,9 @@
 ## Setup
 
 ```bash
+# 카메라 설정 도구 설치
+sudo apt install -y v4l-utils
+
 # 의존성 설치 및 가상환경 동기화
 uv sync
 ```

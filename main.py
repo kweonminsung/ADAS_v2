@@ -16,6 +16,8 @@ main.py — oCam + YOLOv8 pose + Dynamixel 통합
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -37,6 +39,21 @@ from mp3_player import MP3LoopPlayer
 # ──────────────────────────────────────────────
 CAMERA_IDX   = 0                     # oCam 카메라 인덱스
 MODEL_PATH   = "yolov8n-pose.pt"     # YOLO pose 모델
+CAMERA_DEVICE = f"/dev/video{CAMERA_IDX}"
+
+# guvcview 기준 카메라 보정값
+CAMERA_CONTROLS = {
+    "red_balance": 144,
+    "blue_balance": 156,
+    "gain": 123,
+    "exposure_absolute": 128,
+}
+
+# 카메라/드라이버에 따라 수동 노출 컨트롤 이름이 다를 수 있어 둘 다 시도
+MANUAL_EXPOSURE_CONTROLS = {
+    "exposure_auto": 1,
+    "auto_exposure": 1,
+}
 
 # 트래커가 기준으로 쓰는 해상도 (face_tracker_xl430_06_14.py 와 동일)
 TRACKER_W, TRACKER_H = 1280, 720
@@ -149,6 +166,39 @@ def draw_info(frame, nose_x, nose_y, arm_up, confirmed, elapsed, box, fw, fh):
 
 
 # ──────────────────────────────────────────────
+# 카메라 설정
+# ──────────────────────────────────────────────
+
+def apply_camera_controls(device):
+    """guvcview에서 맞춘 V4L2 카메라 값을 실행 전에 적용."""
+    v4l2_ctl = shutil.which("v4l2-ctl")
+    if v4l2_ctl is None:
+        print("[WARN] v4l2-ctl 없음: sudo apt install v4l-utils 후 카메라 설정 자동 적용 가능")
+        return
+
+    controls = {**MANUAL_EXPOSURE_CONTROLS, **CAMERA_CONTROLS}
+    applied = []
+    skipped = []
+
+    for name, value in controls.items():
+        result = subprocess.run(
+            [v4l2_ctl, "-d", device, "--set-ctrl", f"{name}={value}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0:
+            applied.append(name)
+        else:
+            skipped.append(name)
+
+    if applied:
+        print(f"[OK] 카메라 설정 적용: {', '.join(applied)}")
+    if skipped:
+        print(f"[WARN] 지원하지 않는 카메라 설정 건너뜀: {', '.join(skipped)}")
+
+
+# ──────────────────────────────────────────────
 # 메인
 # ──────────────────────────────────────────────
 
@@ -171,6 +221,7 @@ def main(use_motor: bool):
     print("[OK] YOLO 로드 완료")
 
     # 카메라 열기
+    apply_camera_controls(CAMERA_DEVICE)
     cap = cv2.VideoCapture(CAMERA_IDX)
     if not cap.isOpened():
         print("[ERROR] 카메라를 열 수 없습니다.")
