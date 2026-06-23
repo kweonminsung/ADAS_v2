@@ -29,6 +29,11 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype/dejavu")
 warnings.filterwarnings("ignore", message="CUDA initialization:.*")
 
+_V4L2_LIB = "/usr/lib/x86_64-linux-gnu/libv4l/v4l2convert.so"
+if os.path.exists(_V4L2_LIB) and "LD_PRELOAD" not in os.environ:
+    os.environ["LD_PRELOAD"] = _V4L2_LIB
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 import cv2
@@ -41,8 +46,6 @@ from mp3_player import MP3LoopPlayer
 CAMERA_IDX   = 0                     # oCam 카메라 인덱스
 MODEL_PATH   = "yolov8n-pose.pt"     # YOLO pose 모델
 YOLO_DEVICE  = "cpu"                 # WSL CUDA 드라이버 경고 방지를 위해 CPU 추론 사용
-CAMERA_DEVICE = f"/dev/video{CAMERA_IDX}"
-CAMERA_FOURCC = "GRBG"               # /dev/video0 Bayer 포맷
 FRAME_W, FRAME_H = 1280, 720
 
 # 트래커가 기준으로 쓰는 해상도 (face_tracker_xl430_06_14.py 와 동일)
@@ -192,11 +195,9 @@ def ensure_opencv_qt_fonts():
 
 def open_camera(frame_w, frame_h):
     """카메라를 열고 기본 해상도를 적용."""
-    cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
+    cap = cv2.VideoCapture(CAMERA_IDX)
     if not cap.isOpened():
         return None
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*CAMERA_FOURCC))
-    cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_w)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_h)
     cap.set(cv2.CAP_PROP_FPS, 30)
@@ -215,14 +216,6 @@ def read_camera_frame(cap):
 
     if not ret or frame is None:
         return ret, frame
-
-    if frame.size == FRAME_W * FRAME_H:
-        frame = frame.reshape(FRAME_H, FRAME_W)
-
-    if len(frame.shape) == 2:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BayerGR2BGR)
-    elif len(frame.shape) == 3 and frame.shape[2] == 1:
-        frame = cv2.cvtColor(frame[:, :, 0], cv2.COLOR_BayerGR2BGR)
 
     if frame.shape[0] <= 1 or frame.shape[1] <= 1:
         print(f"[WARN] 잘못된 카메라 프레임 크기: {frame.shape}")
