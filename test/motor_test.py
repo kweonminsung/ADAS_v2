@@ -7,12 +7,18 @@
 모터 없이 실행하면 어떤 좌표가 전송될지만 출력합니다.
 
 실행:
-  python3 motor_test.py            # DRY_RUN (좌표 출력만)
-  python3 motor_test.py --motor    # 실제 모터 제어
+  uv run python test/motor_test.py            # DRY_RUN (좌표 출력만)
+  uv run python test/motor_test.py --motor    # 실제 모터 제어
 """
 
 import argparse
+import os
+import sys
 import time
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 # ──────────────────────────────────────────────
 # 화면 해상도 기준 (기존 코드와 동일하게 맞춤)

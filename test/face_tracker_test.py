@@ -9,13 +9,17 @@
 - 모터 없이도 방향 확인만 가능 (DRY_RUN 모드)
 
 실행:
-  python3 face_tracker_test.py            # 모터 없이 방향만 확인
-  python3 face_tracker_test.py --motor    # 모터 연결 + 제어 포함
+  uv run python test/face_tracker_test.py            # 모터 없이 방향만 확인
+  uv run python test/face_tracker_test.py --motor    # 모터 연결 + 제어 포함
 """
 
 import argparse
 import os
 import sys
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 # oCam 등 비표준 포맷 카메라를 OpenCV로 열기 위해 libv4l2 변환 라이브러리를 자동 적용
 _V4L2_LIB = "/usr/lib/x86_64-linux-gnu/libv4l/v4l2convert.so"
