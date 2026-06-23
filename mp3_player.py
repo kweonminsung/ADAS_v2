@@ -8,35 +8,46 @@ from typing import Optional
 
 
 class MP3LoopPlayer:
-    def __init__(self, mp3_path: str, enabled: bool = True):
+    def __init__(self, mp3_path: str, enabled: bool = True, loop: bool = True):
         self.mp3_path = os.path.abspath(mp3_path)
         self.enabled = enabled
+        self.loop = loop
         self.proc: Optional[subprocess.Popen] = None
         self._cmd = self._select_command()
         self._warned = False
 
     def _select_command(self):
         if shutil.which("mpg123"):
-            # -q: quiet, --loop -1: 무한 반복
-            return ["mpg123", "-q", "--loop", "-1", self.mp3_path]
+            cmd = ["mpg123", "-q"]
+            if self.loop:
+                cmd.extend(["--loop", "-1"])
+            cmd.append(self.mp3_path)
+            return cmd
 
         if shutil.which("ffplay"):
-            # -nodisp: 영상창 없음, -loop 0: 무한 반복
-            return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-loop", "0", self.mp3_path]
+            cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
+            if self.loop:
+                cmd.extend(["-loop", "0"])
+            cmd.append(self.mp3_path)
+            return cmd
 
         if os.name == "nt":
             powershell = shutil.which("powershell") or shutil.which("powershell.exe")
             if powershell:
                 mp3_path = self.mp3_path.replace("'", "''")
-                script = (
+                script_parts = [
                     "Add-Type -AssemblyName PresentationCore;"
                     f"$path='{mp3_path}';"
                     "$player=New-Object System.Windows.Media.MediaPlayer;"
                     "$player.Open([System.Uri]::new($path));"
-                    "$player.MediaEnded += { $player.Position = [TimeSpan]::Zero; $player.Play() };"
-                    "$player.Play();"
-                    "while ($true) { Start-Sleep -Milliseconds 200 }"
-                )
+                ]
+                if self.loop:
+                    script_parts.append(
+                        "$player.MediaEnded += { $player.Position = [TimeSpan]::Zero; $player.Play() };"
+                    )
+                script_parts.append("$player.Play();")
+                script_parts.append("while ($true) { Start-Sleep -Milliseconds 200 }")
+                script = "".join(script_parts)
                 return [
                     powershell,
                     "-NoProfile",
@@ -49,13 +60,15 @@ class MP3LoopPlayer:
 
         return None
 
-    def start(self):
+    def start(self, restart: bool = False):
         """이미 재생 중이면 다시 시작하지 않고, 아니면 mp3 반복 재생 시작."""
         if not self.enabled:
             return
 
         if self.proc is not None and self.proc.poll() is None:
-            return
+            if not restart:
+                return
+            self.stop()
 
         if not os.path.exists(self.mp3_path):
             if not self._warned:
@@ -107,6 +120,10 @@ class MP3LoopPlayer:
             self.start()
         else:
             self.stop()
+
+    def play_once(self):
+        """현재 파일을 처음부터 한 번 재생."""
+        self.start(restart=True)
 
     def close(self):
         self.stop()

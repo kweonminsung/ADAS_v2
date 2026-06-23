@@ -16,17 +16,18 @@ main.py — oCam + YOLOv8 pose + Dynamixel 통합
 
 import argparse
 import os
+import select
 import shutil
-import subprocess
 import sys
+import termios
 import time
+import tty
+import warnings
 from collections import defaultdict
 
-# oCam 비표준 포맷 처리를 위해 libv4l2 자동 적용
-_V4L2_LIB = "/usr/lib/x86_64-linux-gnu/libv4l/v4l2convert.so"
-if os.path.exists(_V4L2_LIB) and "LD_PRELOAD" not in os.environ:
-    os.environ["LD_PRELOAD"] = _V4L2_LIB
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype/dejavu")
+warnings.filterwarnings("ignore", message="CUDA initialization:.*")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -39,25 +40,16 @@ from mp3_player import MP3LoopPlayer
 # ──────────────────────────────────────────────
 CAMERA_IDX   = 0                     # oCam 카메라 인덱스
 MODEL_PATH   = "yolov8n-pose.pt"     # YOLO pose 모델
+YOLO_DEVICE  = "cpu"                 # WSL CUDA 드라이버 경고 방지를 위해 CPU 추론 사용
 CAMERA_DEVICE = f"/dev/video{CAMERA_IDX}"
-
-# guvcview 기준 카메라 보정값
-CAMERA_CONTROLS = {
-    "red_balance": 144,
-    "blue_balance": 156,
-    "gain": 123,
-    "exposure_absolute": 128,
-}
-
-# 카메라/드라이버에 따라 수동 노출 컨트롤 이름이 다를 수 있어 둘 다 시도
-MANUAL_EXPOSURE_CONTROLS = {
-    "exposure_auto": 1,
-    "auto_exposure": 1,
-}
+CAMERA_FOURCC = "GRBG"               # /dev/video0 Bayer 포맷
+FRAME_W, FRAME_H = 1280, 720
 
 # 트래커가 기준으로 쓰는 해상도 (face_tracker_xl430_06_14.py 와 동일)
 TRACKER_W, TRACKER_H = 1280, 720
-ROUTE_EXIT_MP3 = os.path.join(BASE_DIR, "route_exit.mp3")
+AUDIO_DIR = os.path.join(BASE_DIR, "audio")
+TRACK_START_MP3 = os.path.join(AUDIO_DIR, "track_start.mp3")
+SAMPLE_MP3 = os.path.join(AUDIO_DIR, "sample.mp3")
 
 # 손 든 상태를 몇 초 유지해야 트래킹 확정할지
 ARM_UP_THRESHOLD = 3.0               # 초
@@ -169,33 +161,106 @@ def draw_info(frame, nose_x, nose_y, arm_up, confirmed, elapsed, box, fw, fh):
 # 카메라 설정
 # ──────────────────────────────────────────────
 
-def apply_camera_controls(device):
-    """guvcview에서 맞춘 V4L2 카메라 값을 실행 전에 적용."""
-    v4l2_ctl = shutil.which("v4l2-ctl")
-    if v4l2_ctl is None:
-        print("[WARN] v4l2-ctl 없음: sudo apt install v4l-utils 후 카메라 설정 자동 적용 가능")
+def ensure_opencv_qt_fonts():
+    """OpenCV Qt backend가 찾는 cv2/qt/fonts 디렉터리에 시스템 폰트를 연결."""
+    cv2_dir = os.path.dirname(cv2.__file__)
+    font_dir = os.path.join(cv2_dir, "qt", "fonts")
+    source_dir = "/usr/share/fonts/truetype/dejavu"
+    font_names = [
+        "DejaVuSans.ttf",
+        "DejaVuSans-Bold.ttf",
+        "DejaVuSansMono.ttf",
+    ]
+
+    if all(os.path.exists(os.path.join(font_dir, name)) for name in font_names):
         return
 
-    controls = {**MANUAL_EXPOSURE_CONTROLS, **CAMERA_CONTROLS}
-    applied = []
-    skipped = []
+    try:
+        os.makedirs(font_dir, exist_ok=True)
+        for name in font_names:
+            source = os.path.join(source_dir, name)
+            target = os.path.join(font_dir, name)
+            if not os.path.exists(source) or os.path.exists(target):
+                continue
+            try:
+                os.symlink(source, target)
+            except OSError:
+                shutil.copy2(source, target)
+    except OSError as e:
+        print(f"[WARN] OpenCV Qt 폰트 설정 실패: {e}")
 
-    for name, value in controls.items():
-        result = subprocess.run(
-            [v4l2_ctl, "-d", device, "--set-ctrl", f"{name}={value}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if result.returncode == 0:
-            applied.append(name)
-        else:
-            skipped.append(name)
 
-    if applied:
-        print(f"[OK] 카메라 설정 적용: {', '.join(applied)}")
-    if skipped:
-        print(f"[WARN] 지원하지 않는 카메라 설정 건너뜀: {', '.join(skipped)}")
+def open_camera(frame_w, frame_h):
+    """카메라를 열고 기본 해상도를 적용."""
+    cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        return None
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*CAMERA_FOURCC))
+    cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_h)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def read_camera_frame(cap):
+    """OpenCV V4L2 오류가 나도 프로그램 전체가 죽지 않게 한 프레임 읽기."""
+    try:
+        ret, frame = cap.read()
+    except cv2.error as e:
+        message = str(e).splitlines()[-1] if str(e) else "unknown OpenCV error"
+        print(f"[WARN] 카메라 프레임 읽기 실패: {message}")
+        return False, None
+
+    if not ret or frame is None:
+        return ret, frame
+
+    if frame.size == FRAME_W * FRAME_H:
+        frame = frame.reshape(FRAME_H, FRAME_W)
+
+    if len(frame.shape) == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BayerGR2BGR)
+    elif len(frame.shape) == 3 and frame.shape[2] == 1:
+        frame = cv2.cvtColor(frame[:, :, 0], cv2.COLOR_BayerGR2BGR)
+
+    if frame.shape[0] <= 1 or frame.shape[1] <= 1:
+        print(f"[WARN] 잘못된 카메라 프레임 크기: {frame.shape}")
+        return False, None
+
+    return True, frame
+
+
+def setup_terminal_keyboard():
+    """터미널에 포커스가 있어도 q/s 단일 키를 받을 수 있게 설정."""
+    if not sys.stdin.isatty():
+        return None
+    old_settings = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin.fileno())
+    return old_settings
+
+
+def restore_terminal_keyboard(old_settings):
+    if old_settings is not None:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+
+def read_terminal_key():
+    if not sys.stdin.isatty():
+        return None
+    readable, _, _ = select.select([sys.stdin], [], [], 0)
+    if not readable:
+        return None
+    return sys.stdin.read(1).lower()
+
+
+def handle_key(key, sample_player):
+    """q는 종료, s는 sample 음성 재생."""
+    if key == "q":
+        return False
+    if key == "s":
+        sample_player.play_once()
+    return True
 
 
 # ──────────────────────────────────────────────
@@ -203,7 +268,9 @@ def apply_camera_controls(device):
 # ──────────────────────────────────────────────
 
 def main(use_motor: bool):
-    route_exit_player = MP3LoopPlayer(ROUTE_EXIT_MP3)
+    ensure_opencv_qt_fonts()
+    track_start_player = MP3LoopPlayer(TRACK_START_MP3, loop=False)
+    sample_player = MP3LoopPlayer(SAMPLE_MP3, loop=False)
 
     # 모터 초기화
     tracker = None
@@ -220,22 +287,16 @@ def main(use_motor: bool):
     model = YOLO(MODEL_PATH)
     print("[OK] YOLO 로드 완료")
 
-    # 카메라 열기
-    apply_camera_controls(CAMERA_DEVICE)
-    cap = cv2.VideoCapture(CAMERA_IDX)
-    if not cap.isOpened():
+    cap = open_camera(FRAME_W, FRAME_H)
+    if cap is None:
         print("[ERROR] 카메라를 열 수 없습니다.")
         sys.exit(1)
-
-    FRAME_W, FRAME_H = 1280, 720
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
 
     # 카메라 워밍업 (초반 검은 프레임 버리기)
     print("[..] 카메라 워밍업 중...")
     for _ in range(20):
-        cap.read()
-    print(f"[OK] 카메라 시작: {FRAME_W}x{FRAME_H}  — q 키로 종료")
+        read_camera_frame(cap)
+    print(f"[OK] 카메라 시작: {FRAME_W}x{FRAME_H}")
 
     # 트래킹 상태
     arm_up_start   = defaultdict(lambda: None)
@@ -244,18 +305,34 @@ def main(use_motor: bool):
     tracked_id     = None
     last_nose_x, last_nose_y = None, None
     last_face_box  = None
+    was_tracking = False
+    terminal_settings = setup_terminal_keyboard()
+    read_fail_count = 0
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                continue
-
-            frame = cv2.flip(frame, 1)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            if not handle_key(read_terminal_key(), sample_player):
                 break
 
-            results = model(frame, verbose=False)
+            ret, frame = read_camera_frame(cap)
+            if not ret:
+                read_fail_count += 1
+                if read_fail_count >= 5:
+                    print("[WARN] 카메라 읽기 오류 반복: 카메라를 다시 엽니다.")
+                    cap.release()
+                    time.sleep(0.3)
+                    cap = open_camera(FRAME_W, FRAME_H)
+                    read_fail_count = 0
+                    if cap is None:
+                        print("[ERROR] 카메라를 다시 열 수 없습니다.")
+                        break
+                time.sleep(0.03)
+                continue
+            read_fail_count = 0
+
+            frame = cv2.flip(frame, 1)
+
+            results = model(frame, verbose=False, device=YOLO_DEVICE)
 
             nose_x, nose_y = None, None
             elapsed = 0.0
@@ -339,17 +416,24 @@ def main(use_motor: bool):
             is_tracking   = tracked_id is not None and arm_confirmed[tracked_id]
             is_arm_raised = tracked_id is not None and not is_tracking
             display_box   = last_face_box if is_tracking else current_face_box
-            route_exit_player.update(is_tracking)
+            if is_tracking and not was_tracking:
+                track_start_player.play_once()
+            was_tracking = is_tracking
+
             draw_info(frame, nose_x, nose_y, is_arm_raised, is_tracking, elapsed, display_box, FRAME_W, FRAME_H)
             cv2.imshow("Face Tracker", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            key = cv2.waitKey(1) & 0xFF
+            if key != 255 and not handle_key(chr(key).lower(), sample_player):
                 break
 
     except KeyboardInterrupt:
         pass
     finally:
-        route_exit_player.close()
-        cap.release()
+        restore_terminal_keyboard(terminal_settings)
+        track_start_player.close()
+        sample_player.close()
+        if cap is not None:
+            cap.release()
         cv2.destroyAllWindows()
         if tracker is not None:
             tracker.close()

@@ -20,7 +20,17 @@ uv run python main.py
 uv run python main.py --motor
 
 # 라즈베리파이 영상 스트림 기반 웹 서버 실행
-uv run python local.py
+uv run python legacy/local.py
+```
+
+## Keys
+
+```bash
+# 실행 화면 종료
+q
+
+# sample 음성 재생
+s
 ```
 
 ## Test
