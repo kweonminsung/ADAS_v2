@@ -3,9 +3,6 @@
 ## Setup
 
 ```bash
-# 카메라 설정 도구 설치
-sudo apt install -y v4l-utils
-
 # 의존성 설치 및 가상환경 동기화
 uv sync
 ```
@@ -14,10 +11,10 @@ uv sync
 
 ```bash
 # 카메라 + YOLO 추적 실행
-uv run python main.py
+uv run main.py
 
 # 카메라 + YOLO 추적 + Dynamixel 모터 제어
-uv run python main.py --motor
+uv run main.py --motor
 
 # 라즈베리파이 영상 스트림 기반 웹 서버 실행
 uv run python legacy/local.py

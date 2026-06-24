@@ -17,7 +17,6 @@ main.py — oCam + YOLOv8 pose + Dynamixel 통합
 import argparse
 import os
 import select
-import shutil
 import sys
 import termios
 import time
@@ -25,18 +24,33 @@ import tty
 import warnings
 from collections import defaultdict
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+USE_V4L2_CONVERT_SO = False
+V4L2_CONVERT_SO = "/usr/lib/x86_64-linux-gnu/libv4l/v4l2convert.so"
+
+
+def enable_v4l2_convert_so_if_needed():
+    """v4l2convert.so 방식 사용 시 LD_PRELOAD 적용 후 프로세스를 재시작."""
+    if not USE_V4L2_CONVERT_SO:
+        return
+    if not os.path.exists(V4L2_CONVERT_SO):
+        print(f"[WARN] v4l2convert.so 파일이 없습니다: {V4L2_CONVERT_SO}")
+        return
+    preload = os.environ.get("LD_PRELOAD", "")
+    if V4L2_CONVERT_SO in preload.split(":"):
+        return
+    os.environ["LD_PRELOAD"] = f"{V4L2_CONVERT_SO}:{preload}" if preload else V4L2_CONVERT_SO
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+enable_v4l2_convert_so_if_needed()
 os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype/dejavu")
 warnings.filterwarnings("ignore", message="CUDA initialization:.*")
-
-_V4L2_LIB = "/usr/lib/x86_64-linux-gnu/libv4l/v4l2convert.so"
-if os.path.exists(_V4L2_LIB) and "LD_PRELOAD" not in os.environ:
-    os.environ["LD_PRELOAD"] = _V4L2_LIB
-    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 import cv2
+import numpy as np
+import torch
 from ultralytics import YOLO
 from mp3_player import MP3LoopPlayer
 
@@ -45,8 +59,18 @@ from mp3_player import MP3LoopPlayer
 # ──────────────────────────────────────────────
 CAMERA_IDX   = 0                     # oCam 카메라 인덱스
 MODEL_PATH   = "yolov8n-pose.pt"     # YOLO pose 모델
-YOLO_DEVICE  = "cpu"                 # WSL CUDA 드라이버 경고 방지를 위해 CPU 추론 사용
+CAMERA_FOURCC = "GRBG"               # /dev/video0 Bayer 포맷
 FRAME_W, FRAME_H = 1280, 720
+BAYER_TO_BGR = cv2.COLOR_BayerGB2BGR # V4L2 GRBG raw → OpenCV BGR
+YUYV_TO_BGR = cv2.COLOR_YUV2BGR_YUY2 # 일부 PC에서 들어오는 YUYV/YUY2 raw → OpenCV BGR
+
+# raw Bayer 변환 후 guvcview 기준 색감에 가깝게 맞추는 후처리값
+COLOR_CORRECTION = {
+    "blue_gain": 1.56,
+    "green_gain": 1.00,
+    "red_gain": 1.44,
+    "brightness_gain": 1.50,
+}
 
 # 트래커가 기준으로 쓰는 해상도 (face_tracker_xl430_06_14.py 와 동일)
 TRACKER_W, TRACKER_H = 1280, 720
@@ -161,43 +185,24 @@ def draw_info(frame, nose_x, nose_y, arm_up, confirmed, elapsed, box, fw, fh):
 
 
 # ──────────────────────────────────────────────
-# 카메라 설정
+# 카메라
 # ──────────────────────────────────────────────
 
-def ensure_opencv_qt_fonts():
-    """OpenCV Qt backend가 찾는 cv2/qt/fonts 디렉터리에 시스템 폰트를 연결."""
-    cv2_dir = os.path.dirname(cv2.__file__)
-    font_dir = os.path.join(cv2_dir, "qt", "fonts")
-    source_dir = "/usr/share/fonts/truetype/dejavu"
-    font_names = [
-        "DejaVuSans.ttf",
-        "DejaVuSans-Bold.ttf",
-        "DejaVuSansMono.ttf",
-    ]
-
-    if all(os.path.exists(os.path.join(font_dir, name)) for name in font_names):
-        return
-
-    try:
-        os.makedirs(font_dir, exist_ok=True)
-        for name in font_names:
-            source = os.path.join(source_dir, name)
-            target = os.path.join(font_dir, name)
-            if not os.path.exists(source) or os.path.exists(target):
-                continue
-            try:
-                os.symlink(source, target)
-            except OSError:
-                shutil.copy2(source, target)
-    except OSError as e:
-        print(f"[WARN] OpenCV Qt 폰트 설정 실패: {e}")
+def select_yolo_device():
+    """CUDA GPU가 사용 가능하면 cuda:0, 아니면 CPU를 사용."""
+    return "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
 def open_camera(frame_w, frame_h):
     """카메라를 열고 기본 해상도를 적용."""
-    cap = cv2.VideoCapture(CAMERA_IDX)
+    cap = cv2.VideoCapture(CAMERA_IDX, cv2.CAP_V4L2)
     if not cap.isOpened():
         return None
+    if USE_V4L2_CONVERT_SO:
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+    else:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*CAMERA_FOURCC))
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_w)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_h)
     cap.set(cv2.CAP_PROP_FPS, 30)
@@ -217,11 +222,47 @@ def read_camera_frame(cap):
     if not ret or frame is None:
         return ret, frame
 
+    if not USE_V4L2_CONVERT_SO and frame.size == FRAME_W * FRAME_H:
+        frame = frame.reshape(FRAME_H, FRAME_W)
+
+    if USE_V4L2_CONVERT_SO:
+        if len(frame.shape) == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    elif len(frame.shape) == 2:
+        frame = cv2.cvtColor(frame, BAYER_TO_BGR)
+    elif len(frame.shape) == 3 and frame.shape[2] == 1:
+        frame = cv2.cvtColor(frame[:, :, 0], BAYER_TO_BGR)
+    elif len(frame.shape) == 3 and frame.shape[2] == 2:
+        frame = cv2.cvtColor(frame, YUYV_TO_BGR)
+
     if frame.shape[0] <= 1 or frame.shape[1] <= 1:
         print(f"[WARN] 잘못된 카메라 프레임 크기: {frame.shape}")
         return False, None
+    if len(frame.shape) != 3 or frame.shape[2] != 3:
+        print(f"[WARN] 지원하지 않는 카메라 프레임 형식: {frame.shape}")
+        return False, None
 
+    frame = apply_color_correction(frame)
     return True, frame
+
+
+def apply_color_correction(frame):
+    """BGR 프레임에 guvcview 느낌의 색감 보정을 후처리로 적용."""
+    channel_gains = get_color_correction_gains(COLOR_CORRECTION)
+    corrected = frame.astype("float32")
+    corrected *= channel_gains
+    return corrected.clip(0, 255).astype("uint8")
+
+
+def get_color_correction_gains(config):
+    """guvcview식 보정값을 BGR 후처리용 채널 gain으로 변환."""
+    color_gains = np.sqrt(np.array([
+        config["blue_gain"],
+        config["green_gain"],
+        config["red_gain"],
+    ], dtype=np.float32))
+    brightness_gain = np.sqrt(np.float32(config["brightness_gain"]))
+    return color_gains * brightness_gain
 
 
 def setup_terminal_keyboard():
@@ -261,7 +302,6 @@ def handle_key(key, sample_player):
 # ──────────────────────────────────────────────
 
 def main(use_motor: bool):
-    ensure_opencv_qt_fonts()
     track_start_player = MP3LoopPlayer(TRACK_START_MP3, loop=False)
     sample_player = MP3LoopPlayer(SAMPLE_MP3, loop=False)
 
@@ -276,7 +316,8 @@ def main(use_motor: bool):
             print(f"[WARN] 모터 연결 실패 → DRY_RUN: {e}")
 
     # YOLO 모델 로드
-    print("[..] YOLO 모델 로딩 중...")
+    yolo_device = select_yolo_device()
+    print(f"[..] YOLO 모델 로딩 중... device={yolo_device}")
     model = YOLO(MODEL_PATH)
     print("[OK] YOLO 로드 완료")
 
@@ -325,7 +366,7 @@ def main(use_motor: bool):
 
             frame = cv2.flip(frame, 1)
 
-            results = model(frame, verbose=False, device=YOLO_DEVICE)
+            results = model(frame, verbose=False, device=yolo_device)
 
             nose_x, nose_y = None, None
             elapsed = 0.0
