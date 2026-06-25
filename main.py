@@ -69,7 +69,7 @@ COLOR_CORRECTION = {
     "blue_gain": 1.56,
     "green_gain": 1.00,
     "red_gain": 1.44,
-    "brightness_gain": 1.50,
+    "brightness_gain": 5.00,
 }
 
 # 트래커가 기준으로 쓰는 해상도 (face_tracker_xl430_06_14.py 와 동일)
@@ -91,14 +91,12 @@ FACE_BOX_PAD = 30                    # 픽셀
 
 ROUTE_EXIT_COOLDOWN = 3.0            # 초
 
-# 노랑/검정 안전 테이프를 횡단보도 경계로 사용
-TAPE_MIN_AREA = 2500
-TAPE_MIN_SIDE_LENGTH = 20
-CROSSWALK_DETECT_INTERVAL = 10       # N프레임마다 테이프 구역 갱신
-YELLOW_HSV_LOWER = np.array([15, 70, 70], dtype=np.uint8)
-YELLOW_HSV_UPPER = np.array([45, 255, 255], dtype=np.uint8)
-BLACK_HSV_LOWER = np.array([0, 0, 0], dtype=np.uint8)
-BLACK_HSV_UPPER = np.array([180, 255, 80], dtype=np.uint8)
+# AprilTag 0,1,2,3을 횡단보도 꼭짓점으로 사용: 0=좌상, 1=우상, 2=우하, 3=좌하
+APRILTAG_IDS = (0, 1, 2, 3)
+APRILTAG_DICT_TYPE = cv2.aruco.DICT_APRILTAG_36h11
+CROSSWALK_DETECT_INTERVAL = 5        # N프레임마다 AprilTag 구역 갱신
+CROSSWALK_MIN_AREA = 2500
+APRILTAG_LOG_INTERVAL = 1.0           # 초 단위 AprilTag 디버그 로그 간격
 
 # YOLOv8 pose keypoint 인덱스 (COCO 기준)
 KP_NOSE          = 0
@@ -197,79 +195,75 @@ def draw_info(frame, nose_x, nose_y, arm_up, confirmed, elapsed, box, fw, fh):
 
 
 # ──────────────────────────────────────────────
-# 횡단보도 영역 인식 (노랑/검정 안전 테이프)
+# 횡단보도 영역 인식 (AprilTag 0,1,2,3)
 # ──────────────────────────────────────────────
 
-def detect_tape_crosswalk_polygon(frame):
-    """노랑/검정 안전 테이프 윤곽을 이용해 횡단보도 사각형을 추정."""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    yellow_mask = cv2.inRange(hsv, YELLOW_HSV_LOWER, YELLOW_HSV_UPPER)
-    black_mask = cv2.inRange(hsv, BLACK_HSV_LOWER, BLACK_HSV_UPPER)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, kernel)
-    yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel)
-
-    yellow_nearby = cv2.dilate(yellow_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31)))
-    tape_mask = cv2.bitwise_or(yellow_mask, cv2.bitwise_and(black_mask, yellow_nearby))
-    tape_mask = cv2.morphologyEx(tape_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25)))
-    tape_mask = cv2.dilate(tape_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)))
-
-    contours, _ = cv2.findContours(tape_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    significant = [contour for contour in contours if cv2.contourArea(contour) >= TAPE_MIN_AREA]
-    if not significant:
-        return None
-
-    points = np.vstack(significant)
-    polygon = make_tape_quadrilateral(points)
-    if polygon is None:
-        return None
-    return polygon
+def create_apriltag_detector():
+    """OpenCV AprilTag detector를 생성."""
+    tag_dict = cv2.aruco.getPredefinedDictionary(APRILTAG_DICT_TYPE)
+    parameters = cv2.aruco.DetectorParameters()
+    if hasattr(cv2.aruco, "CORNER_REFINE_APRILTAG"):
+        parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
+    parameters.minMarkerPerimeterRate = 0.02
+    parameters.maxMarkerPerimeterRate = 4.0
+    parameters.polygonalApproxAccuracyRate = 0.05
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        return cv2.aruco.ArucoDetector(tag_dict, parameters)
+    return tag_dict, parameters
 
 
-def make_tape_quadrilateral(points):
-    """테이프 윤곽에서 유효한 4점 사각형만 생성."""
-    hull = cv2.convexHull(points)
-    perimeter = cv2.arcLength(hull, True)
-    if perimeter <= 1:
-        return None
+def detect_apriltag_markers(frame, detector):
+    """프레임에서 AprilTag를 검출."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        corners, ids, _ = detector.detectMarkers(gray)
+    else:
+        tag_dict, parameters = detector
+        corners, ids, _ = cv2.aruco.detectMarkers(gray, tag_dict, parameters=parameters)
+    return corners, ids
 
-    for ratio in (0.02, 0.03, 0.04, 0.06, 0.08):
-        approx = cv2.approxPolyDP(hull, ratio * perimeter, True)
-        if len(approx) != 4:
+
+def detect_apriltag_crosswalk_polygon(frame, detector, debug=False):
+    """AprilTag ID 0,1,2,3 중심점으로 횡단보도 사각형을 생성."""
+    corners, ids = detect_apriltag_markers(frame, detector)
+    if ids is None:
+        if debug:
+            print("[APRILTAG] detected=0 ids=None")
+        return None, corners, ids
+
+    centers = {}
+    detected_ids = [int(marker_id) for marker_id in ids.flatten()]
+    for marker_id, marker_corners in zip(ids.flatten(), corners):
+        marker_id = int(marker_id)
+        if marker_id not in APRILTAG_IDS:
             continue
-        polygon = order_polygon_points(approx.reshape(4, 2))
-        if is_valid_quadrilateral(polygon):
-            return polygon
+        points = marker_corners.reshape(4, 2)
+        centers[marker_id] = points.mean(axis=0)
 
-    rect = cv2.minAreaRect(points.astype(np.float32))
-    polygon = order_polygon_points(cv2.boxPoints(rect))
-    if not is_valid_quadrilateral(polygon):
-        return None
-    return polygon
+    if not all(marker_id in centers for marker_id in APRILTAG_IDS):
+        if debug:
+            missing_ids = [marker_id for marker_id in APRILTAG_IDS if marker_id not in centers]
+            print(f"[APRILTAG] detected={len(detected_ids)} ids={detected_ids} missing_required={missing_ids}")
+        return None, corners, ids
 
-
-def order_polygon_points(points):
-    """사각형 점을 좌상, 우상, 우하, 좌하 순서로 정렬."""
-    points = np.asarray(points, dtype=np.float32)
-    sums = points.sum(axis=1)
-    diffs = np.diff(points, axis=1).reshape(-1)
-    ordered = np.array([
-        points[np.argmin(sums)],
-        points[np.argmin(diffs)],
-        points[np.argmax(sums)],
-        points[np.argmax(diffs)],
-    ], dtype=np.int32)
-    return ordered
+    polygon = np.array([centers[marker_id] for marker_id in APRILTAG_IDS], dtype=np.int32)
+    if not is_valid_crosswalk_polygon(polygon):
+        if debug:
+            area = cv2.contourArea(polygon)
+            print(f"[APRILTAG] detected={len(detected_ids)} ids={detected_ids} invalid_polygon area={area:.1f} polygon={polygon.tolist()}")
+        return None, corners, ids
+    if debug:
+        print(f"[APRILTAG] detected={len(detected_ids)} ids={detected_ids} polygon={polygon.tolist()}")
+    return polygon, corners, ids
 
 
-def is_valid_quadrilateral(polygon):
+def is_valid_crosswalk_polygon(polygon):
     """삼각형/직선/중복 꼭짓점/너무 작은 도형을 제외하고 4점 사각형만 허용."""
     if polygon is None or len(polygon) != 4:
         return False
     if len(np.unique(polygon, axis=0)) != 4:
         return False
-    if cv2.contourArea(polygon) < TAPE_MIN_AREA:
+    if cv2.contourArea(polygon) < CROSSWALK_MIN_AREA:
         return False
 
     points = polygon.astype(np.float32)
@@ -277,7 +271,16 @@ def is_valid_quadrilateral(polygon):
         np.linalg.norm(points[(i + 1) % 4] - points[i])
         for i in range(4)
     ]
-    return min(side_lengths) >= TAPE_MIN_SIDE_LENGTH
+    return min(side_lengths) > 1
+
+
+def mirror_polygon_x(polygon, frame_width):
+    """좌우 반전된 화면 좌표계에 맞도록 polygon x좌표를 변환."""
+    if polygon is None:
+        return None
+    mirrored = polygon.copy()
+    mirrored[:, 0] = frame_width - 1 - mirrored[:, 0]
+    return mirrored
 
 
 def is_point_inside_polygon(x, y, polygon):
@@ -290,7 +293,7 @@ def is_point_inside_polygon(x, y, polygon):
 def draw_crosswalk_area(frame, polygon, is_inside):
     """검출된 횡단보도 영역을 화면에 표시."""
     if polygon is None:
-        cv2.putText(frame, "Crosswalk: waiting tape", (20, FRAME_H - 25),
+        cv2.putText(frame, "Crosswalk: waiting AprilTags", (20, FRAME_H - 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         return
 
@@ -307,7 +310,7 @@ def draw_crosswalk_area(frame, polygon, is_inside):
         cv2.putText(frame, str(marker_id), (int(x) + 8, int(y) - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-    label = "Crosswalk(Tape): inside" if is_inside else "Crosswalk(Tape): OUT"
+    label = "Crosswalk(AprilTag): inside" if is_inside else "Crosswalk(AprilTag): OUT"
     cv2.putText(frame, label, (20, FRAME_H - 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
@@ -433,6 +436,7 @@ def main(use_motor: bool):
     track_start_player = MP3LoopPlayer(TRACK_START_MP3, loop=False)
     sample_player = MP3LoopPlayer(SAMPLE_MP3, loop=False)
     route_exit_player = MP3LoopPlayer(ROUTE_EXIT_MP3, loop=False)
+    apriltag_detector = create_apriltag_detector()
 
     # 모터 초기화
     tracker = None
@@ -449,6 +453,7 @@ def main(use_motor: bool):
     print(f"[..] YOLO 모델 로딩 중... device={yolo_device}")
     model = YOLO(MODEL_PATH)
     print("[OK] YOLO 로드 완료")
+    print(f"[APRILTAG] OpenCV={cv2.__version__} dict=DICT_APRILTAG_36h11 required_ids={list(APRILTAG_IDS)}")
 
     cap = open_camera(FRAME_W, FRAME_H)
     if cap is None:
@@ -473,6 +478,7 @@ def main(use_motor: bool):
     last_route_exit_time = 0.0
     crosswalk_polygon = None
     crosswalk_detect_count = 0
+    last_apriltag_log_time = 0.0
     terminal_settings = setup_terminal_keyboard()
     read_fail_count = 0
 
@@ -497,12 +503,22 @@ def main(use_motor: bool):
                 continue
             read_fail_count = 0
 
-            frame = cv2.flip(frame, 1)
+            raw_frame = frame
             crosswalk_detect_count += 1
             if crosswalk_detect_count % CROSSWALK_DETECT_INTERVAL == 0:
-                detected_polygon = detect_tape_crosswalk_polygon(frame)
+                now = time.time()
+                log_apriltag = now - last_apriltag_log_time >= APRILTAG_LOG_INTERVAL
+                detected_polygon, _, _ = detect_apriltag_crosswalk_polygon(
+                    raw_frame,
+                    apriltag_detector,
+                    debug=log_apriltag,
+                )
+                if log_apriltag:
+                    last_apriltag_log_time = now
                 if detected_polygon is not None:
-                    crosswalk_polygon = detected_polygon
+                    crosswalk_polygon = mirror_polygon_x(detected_polygon, FRAME_W)
+
+            frame = cv2.flip(raw_frame, 1)
 
             results = model(frame, verbose=False, device=yolo_device)
 
