@@ -77,6 +77,7 @@ TRACKER_W, TRACKER_H = 1280, 720
 AUDIO_DIR = os.path.join(BASE_DIR, "audio")
 TRACK_START_MP3 = os.path.join(AUDIO_DIR, "track_start.mp3")
 SAMPLE_MP3 = os.path.join(AUDIO_DIR, "sample.mp3")
+ROUTE_EXIT_MP3 = os.path.join(AUDIO_DIR, "route_exit.mp3")
 
 # 손 든 상태를 몇 초 유지해야 트래킹 확정할지
 ARM_UP_THRESHOLD = 3.0               # 초
@@ -87,6 +88,17 @@ ARM_DOWN_GRACE = 10                  # 프레임
 
 # 얼굴 박스 패딩 (헤드 keypoint 범위 밖으로 여유 픽셀)
 FACE_BOX_PAD = 30                    # 픽셀
+
+ROUTE_EXIT_COOLDOWN = 3.0            # 초
+
+# 노랑/검정 안전 테이프를 횡단보도 경계로 사용
+TAPE_MIN_AREA = 2500
+TAPE_MIN_SIDE_LENGTH = 20
+CROSSWALK_DETECT_INTERVAL = 10       # N프레임마다 테이프 구역 갱신
+YELLOW_HSV_LOWER = np.array([15, 70, 70], dtype=np.uint8)
+YELLOW_HSV_UPPER = np.array([45, 255, 255], dtype=np.uint8)
+BLACK_HSV_LOWER = np.array([0, 0, 0], dtype=np.uint8)
+BLACK_HSV_UPPER = np.array([180, 255, 80], dtype=np.uint8)
 
 # YOLOv8 pose keypoint 인덱스 (COCO 기준)
 KP_NOSE          = 0
@@ -182,6 +194,122 @@ def draw_info(frame, nose_x, nose_y, arm_up, confirmed, elapsed, box, fw, fh):
         cv2.line(frame, (nose_x, nose_y), (cx, cy), (255, 100, 0), 1)
         cv2.putText(frame, f"TRACKING  Nose:({nose_x},{nose_y})", (20, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+
+
+# ──────────────────────────────────────────────
+# 횡단보도 영역 인식 (노랑/검정 안전 테이프)
+# ──────────────────────────────────────────────
+
+def detect_tape_crosswalk_polygon(frame):
+    """노랑/검정 안전 테이프 윤곽을 이용해 횡단보도 사각형을 추정."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    yellow_mask = cv2.inRange(hsv, YELLOW_HSV_LOWER, YELLOW_HSV_UPPER)
+    black_mask = cv2.inRange(hsv, BLACK_HSV_LOWER, BLACK_HSV_UPPER)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, kernel)
+    yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel)
+
+    yellow_nearby = cv2.dilate(yellow_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31)))
+    tape_mask = cv2.bitwise_or(yellow_mask, cv2.bitwise_and(black_mask, yellow_nearby))
+    tape_mask = cv2.morphologyEx(tape_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25)))
+    tape_mask = cv2.dilate(tape_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)))
+
+    contours, _ = cv2.findContours(tape_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    significant = [contour for contour in contours if cv2.contourArea(contour) >= TAPE_MIN_AREA]
+    if not significant:
+        return None
+
+    points = np.vstack(significant)
+    polygon = make_tape_quadrilateral(points)
+    if polygon is None:
+        return None
+    return polygon
+
+
+def make_tape_quadrilateral(points):
+    """테이프 윤곽에서 유효한 4점 사각형만 생성."""
+    hull = cv2.convexHull(points)
+    perimeter = cv2.arcLength(hull, True)
+    if perimeter <= 1:
+        return None
+
+    for ratio in (0.02, 0.03, 0.04, 0.06, 0.08):
+        approx = cv2.approxPolyDP(hull, ratio * perimeter, True)
+        if len(approx) != 4:
+            continue
+        polygon = order_polygon_points(approx.reshape(4, 2))
+        if is_valid_quadrilateral(polygon):
+            return polygon
+
+    rect = cv2.minAreaRect(points.astype(np.float32))
+    polygon = order_polygon_points(cv2.boxPoints(rect))
+    if not is_valid_quadrilateral(polygon):
+        return None
+    return polygon
+
+
+def order_polygon_points(points):
+    """사각형 점을 좌상, 우상, 우하, 좌하 순서로 정렬."""
+    points = np.asarray(points, dtype=np.float32)
+    sums = points.sum(axis=1)
+    diffs = np.diff(points, axis=1).reshape(-1)
+    ordered = np.array([
+        points[np.argmin(sums)],
+        points[np.argmin(diffs)],
+        points[np.argmax(sums)],
+        points[np.argmax(diffs)],
+    ], dtype=np.int32)
+    return ordered
+
+
+def is_valid_quadrilateral(polygon):
+    """삼각형/직선/중복 꼭짓점/너무 작은 도형을 제외하고 4점 사각형만 허용."""
+    if polygon is None or len(polygon) != 4:
+        return False
+    if len(np.unique(polygon, axis=0)) != 4:
+        return False
+    if cv2.contourArea(polygon) < TAPE_MIN_AREA:
+        return False
+
+    points = polygon.astype(np.float32)
+    side_lengths = [
+        np.linalg.norm(points[(i + 1) % 4] - points[i])
+        for i in range(4)
+    ]
+    return min(side_lengths) >= TAPE_MIN_SIDE_LENGTH
+
+
+def is_point_inside_polygon(x, y, polygon):
+    """점이 다각형 내부 또는 경계 위에 있으면 True."""
+    if polygon is None:
+        return True
+    return cv2.pointPolygonTest(polygon.astype(np.float32), (float(x), float(y)), False) >= 0
+
+
+def draw_crosswalk_area(frame, polygon, is_inside):
+    """검출된 횡단보도 영역을 화면에 표시."""
+    if polygon is None:
+        cv2.putText(frame, "Crosswalk: waiting tape", (20, FRAME_H - 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        return
+
+    color = (0, 255, 0) if is_inside else (0, 0, 255)
+    cv2.polylines(frame, [polygon], True, color, 3)
+
+    overlay = frame.copy()
+    cv2.fillPoly(overlay, [polygon], color)
+    cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
+
+    for marker_id, point in enumerate(polygon):
+        x, y = point
+        cv2.circle(frame, (int(x), int(y)), 6, (0, 255, 255), -1)
+        cv2.putText(frame, str(marker_id), (int(x) + 8, int(y) - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+    label = "Crosswalk(Tape): inside" if is_inside else "Crosswalk(Tape): OUT"
+    cv2.putText(frame, label, (20, FRAME_H - 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
 
 # ──────────────────────────────────────────────
@@ -304,6 +432,7 @@ def handle_key(key, sample_player):
 def main(use_motor: bool):
     track_start_player = MP3LoopPlayer(TRACK_START_MP3, loop=False)
     sample_player = MP3LoopPlayer(SAMPLE_MP3, loop=False)
+    route_exit_player = MP3LoopPlayer(ROUTE_EXIT_MP3, loop=False)
 
     # 모터 초기화
     tracker = None
@@ -340,6 +469,10 @@ def main(use_motor: bool):
     last_nose_x, last_nose_y = None, None
     last_face_box  = None
     was_tracking = False
+    was_outside_crosswalk = False
+    last_route_exit_time = 0.0
+    crosswalk_polygon = None
+    crosswalk_detect_count = 0
     terminal_settings = setup_terminal_keyboard()
     read_fail_count = 0
 
@@ -365,6 +498,11 @@ def main(use_motor: bool):
             read_fail_count = 0
 
             frame = cv2.flip(frame, 1)
+            crosswalk_detect_count += 1
+            if crosswalk_detect_count % CROSSWALK_DETECT_INTERVAL == 0:
+                detected_polygon = detect_tape_crosswalk_polygon(frame)
+                if detected_polygon is not None:
+                    crosswalk_polygon = detected_polygon
 
             results = model(frame, verbose=False, device=yolo_device)
 
@@ -454,6 +592,22 @@ def main(use_motor: bool):
                 track_start_player.play_once()
             was_tracking = is_tracking
 
+            is_inside_crosswalk = True
+            if is_tracking and nose_x is not None and nose_y is not None and crosswalk_polygon is not None:
+                is_inside_crosswalk = is_point_inside_polygon(nose_x, nose_y, crosswalk_polygon)
+                now = time.time()
+                if (
+                    not is_inside_crosswalk
+                    and not was_outside_crosswalk
+                    and now - last_route_exit_time >= ROUTE_EXIT_COOLDOWN
+                ):
+                    route_exit_player.play_once()
+                    last_route_exit_time = now
+                was_outside_crosswalk = not is_inside_crosswalk
+            elif not is_tracking:
+                was_outside_crosswalk = False
+
+            draw_crosswalk_area(frame, crosswalk_polygon, is_inside_crosswalk)
             draw_info(frame, nose_x, nose_y, is_arm_raised, is_tracking, elapsed, display_box, FRAME_W, FRAME_H)
             cv2.imshow("Face Tracker", frame)
             key = cv2.waitKey(1) & 0xFF
@@ -466,6 +620,7 @@ def main(use_motor: bool):
         restore_terminal_keyboard(terminal_settings)
         track_start_player.close()
         sample_player.close()
+        route_exit_player.close()
         if cap is not None:
             cap.release()
         cv2.destroyAllWindows()

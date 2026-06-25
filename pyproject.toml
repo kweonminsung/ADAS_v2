@@ -8,8 +8,21 @@ dependencies = [
     "flask>=3.0",
     "numpy==1.26.4",
     "opencv-python==4.10.0.84",
+    "torch==1.13.1+cu116",
+    "torchaudio==0.13.1+cu116",
+    "torchvision==0.14.1+cu116",
     "ultralytics==8.4.72",
 ]
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu116" }
+torchaudio = { index = "pytorch-cu116" }
+torchvision = { index = "pytorch-cu116" }
+
+[[tool.uv.index]]
+name = "pytorch-cu116"
+url = "https://download.pytorch.org/whl/cu116"
+explicit = true
